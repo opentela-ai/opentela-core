@@ -1,13 +1,20 @@
-//! Node-side tool: key generation, preflight, and an iperf-style bulk test over the library's streams.
+//! Node-side tool: key generation, preflight, an iperf-style bulk test, and TCP port forwarding over the
+//! library's streams.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use opentela_bin::{init_logging, IdentityArgs};
-use opentela_core::{Config, Error, Keypair, Node, PeerId, Step};
+use opentela_core::{
+    Config, Congestion, Connection, Error, Keypair, Node, PeerId, QuicTuning, Step,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
 #[derive(Debug, Parser)]
@@ -56,6 +63,49 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         repeat: usize,
     },
+    /// Carry local TCP ports to services on peers, and serve the services this node exposes.
+    /// Each local connection becomes one stream; the peer connects it to the named target.
+    Forward {
+        #[command(flatten)]
+        node: NodeArgs,
+        /// LISTEN=PEER/TARGET, e.g. 127.0.0.1:7202=<peer id>/127.0.0.1:7202. Repeatable or comma-separated.
+        #[arg(long, value_delimiter = ',')]
+        local: Vec<LocalForward>,
+        /// Targets peers may reach through this node, e.g. 127.0.0.1:7202. Anything else is refused.
+        #[arg(long, value_delimiter = ',')]
+        expose: Vec<SocketAddr>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct LocalForward {
+    listen: SocketAddr,
+    peer: PeerId,
+    target: SocketAddr,
+}
+
+impl FromStr for LocalForward {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let (listen, rest) = s.split_once('=').ok_or("expected LISTEN=PEER/TARGET")?;
+        let (peer, target) = rest.split_once('/').ok_or("expected LISTEN=PEER/TARGET")?;
+        Ok(Self {
+            listen: listen
+                .parse()
+                .map_err(|e| format!("listen {listen}: {e}"))?,
+            peer: peer.parse().map_err(|e| format!("peer {peer}: {e:?}"))?,
+            target: target
+                .parse()
+                .map_err(|e| format!("target {target}: {e}"))?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CongestionArg {
+    Cubic,
+    Bbr,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -82,6 +132,12 @@ struct NodeArgs {
     /// Ladder steps to try, in order (default: all).
     #[arg(long, value_delimiter = ',')]
     ladder: Vec<LadderStep>,
+    /// QUIC congestion controller (userspace; TCP paths keep the kernel's).
+    #[arg(long, value_enum, default_value = "cubic")]
+    congestion: CongestionArg,
+    /// QUIC per-stream receive window in MiB; one stream carries at most this per RTT.
+    #[arg(long, default_value_t = 2)]
+    stream_window_mib: u32,
 }
 
 impl NodeArgs {
@@ -92,6 +148,13 @@ impl NodeArgs {
         config.advertise = self.advertise.clone();
         config.rendezvous = self.rendezvous.clone();
         config.relays = self.relay.clone();
+        config.quic = QuicTuning {
+            congestion: match self.congestion {
+                CongestionArg::Cubic => Congestion::Cubic,
+                CongestionArg::Bbr => Congestion::Bbr,
+            },
+            stream_window: self.stream_window_mib << 20,
+        };
         if !self.ladder.is_empty() {
             config.ladder = self
                 .ladder
@@ -224,7 +287,133 @@ async fn run(cli: Cli) -> Result<(), Error> {
                 serde_json::to_string(&conn.report()).expect("report serializes")
             );
         }
+        Command::Forward {
+            node,
+            local,
+            expose,
+        } => forward(node.start().await?, local, expose).await?,
     }
+    Ok(())
+}
+
+const SPLICE_BUFFER: usize = 256 << 10;
+
+/// One connection per peer, made on first use and remade when a stream cannot be opened on it.
+type Connections = Arc<tokio::sync::Mutex<HashMap<PeerId, Arc<Connection>>>>;
+
+async fn forward(
+    node: Node,
+    local: Vec<LocalForward>,
+    expose: Vec<SocketAddr>,
+) -> Result<(), Error> {
+    let node = Arc::new(node);
+    println!("forwarding as {} on {}", node.peer_id(), node.local_addr());
+    let connections: Connections = Arc::default();
+    for rule in local {
+        let listener = TcpListener::bind(rule.listen).await?;
+        info!(listen = %rule.listen, peer = %rule.peer, target = %rule.target, "local forward");
+        let node = node.clone();
+        let connections = connections.clone();
+        tokio::spawn(async move {
+            loop {
+                let (socket, remote) = match listener.accept().await {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        warn!(%error, "local accept failed");
+                        continue;
+                    }
+                };
+                let node = node.clone();
+                let connections = connections.clone();
+                let rule = rule.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = carry(&node, &connections, &rule, socket).await {
+                        warn!(%remote, target = %rule.target, %error, "forward failed");
+                    }
+                });
+            }
+        });
+    }
+    loop {
+        let stream = node.accept().await?;
+        let expose = expose.clone();
+        tokio::spawn(async move {
+            let peer = stream.peer();
+            if let Err(error) = deliver(stream, &expose).await {
+                warn!(%peer, %error, "inbound forward failed");
+            }
+        });
+    }
+}
+
+async fn carry(
+    node: &Node,
+    connections: &Connections,
+    rule: &LocalForward,
+    mut socket: TcpStream,
+) -> Result<(), Error> {
+    socket.set_nodelay(true)?;
+    let mut stream = None;
+    for _ in 0..2 {
+        let conn = {
+            let mut cached = connections.lock().await;
+            match cached.get(&rule.peer) {
+                Some(conn) if conn.is_alive() => conn.clone(),
+                _ => {
+                    let conn = Arc::new(node.connect(rule.peer).await?);
+                    let report = conn.report();
+                    info!(peer = %rule.peer, kind = ?report.kind, transport = ?report.transport, via = %report.via, rtt_ms = report.rtt_ms, "forward path");
+                    cached.insert(rule.peer, conn.clone());
+                    conn
+                }
+            }
+        };
+        match conn.open_stream().await {
+            Ok(opened) => {
+                stream = Some(opened);
+                break;
+            }
+            Err(error) => {
+                warn!(peer = %rule.peer, %error, "stream open failed; reconnecting");
+                connections.lock().await.remove(&rule.peer);
+            }
+        }
+    }
+    let mut stream = stream.ok_or(Error::Closed)?;
+    let target = rule.target.to_string();
+    stream.write_u8(target.len() as u8).await?;
+    stream.write_all(target.as_bytes()).await?;
+    tokio::io::copy_bidirectional_with_sizes(
+        &mut socket,
+        &mut stream,
+        SPLICE_BUFFER,
+        SPLICE_BUFFER,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn deliver(mut stream: opentela_core::Stream, expose: &[SocketAddr]) -> Result<(), Error> {
+    let len = stream.read_u8().await? as usize;
+    let mut target = vec![0u8; len];
+    stream.read_exact(&mut target).await?;
+    let target: SocketAddr = std::str::from_utf8(&target)
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .ok_or_else(|| Error::Protocol("malformed forward target".into()))?;
+    if !expose.contains(&target) {
+        return Err(Error::Protocol(format!("target {target} is not exposed")));
+    }
+    let mut socket = TcpStream::connect(target).await?;
+    socket.set_nodelay(true)?;
+    info!(peer = %stream.peer(), %target, path = ?stream.path(), transport = ?stream.transport(), "inbound forward");
+    tokio::io::copy_bidirectional_with_sizes(
+        &mut stream,
+        &mut socket,
+        SPLICE_BUFFER,
+        SPLICE_BUFFER,
+    )
+    .await?;
     Ok(())
 }
 

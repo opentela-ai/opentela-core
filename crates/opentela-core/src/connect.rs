@@ -16,10 +16,9 @@ use crate::node::{Inner, Node};
 use crate::punch::{punch_socket, sim_open, spray};
 use crate::services::resolve;
 use crate::stream::{
-    Attempt, Outcome, PathKind, PathReport, QuicCongestion, Stream, Transport, HELLO_PROBE,
-    HELLO_STREAM,
+    Attempt, Outcome, PathKind, PathReport, Stream, Transport, HELLO_PROBE, HELLO_STREAM,
 };
-use crate::tls::{quic_identity, ChannelBinding, Expect, ALPN_PEER, ALPN_RELAY};
+use crate::tls::{quic_identity, ChannelBinding, Congestion, Expect, ALPN_PEER, ALPN_RELAY};
 use crate::wire::{read_frame, write_frame, Msg, Record};
 use crate::{Error, Step};
 
@@ -289,7 +288,7 @@ fn quic_established(
     peer: PeerId,
     conn: quinn::Connection,
     kind: PathKind,
-    congestion: QuicCongestion,
+    congestion: Congestion,
 ) -> Result<Established, Error> {
     let (seen, binding) = quic_identity(&conn)?;
     debug_assert_eq!(seen, peer, "the verifier pinned the peer id");

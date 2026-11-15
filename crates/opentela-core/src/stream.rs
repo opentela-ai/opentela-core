@@ -38,27 +38,6 @@ pub enum PathKind {
     Relayed,
 }
 
-/// quinn's congestion controller. BBR is the default: on lossy long paths loss-based control collapses (cubic
-/// moved 0.5-0.8 MB/s where BBR moved 18-20 MB/s on one), and the user-space choice needs no root or kernel module.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QuicCongestion {
-    #[default]
-    Bbr,
-    Cubic,
-    NewReno,
-}
-
-impl QuicCongestion {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Bbr => "bbr",
-            Self::Cubic => "cubic",
-            Self::NewReno => "new_reno",
-        }
-    }
-}
-
 /// One rung of the connection ladder, tried in the configured order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -251,7 +251,7 @@ laptop on any port, including 22, 443 and UDP. Only hosts inside ETH such as sgs
   limit of 1024 reassembly gaps, and quinn then kills the connection (seen at 16 and 64 MiB). One QUIC stream
   therefore carries at most 2 MiB per RTT, so bulk transfers should use several streams. The connection
   window is 128 MiB.
-- QUIC uses quinn's BBR by default (`Config::quic_congestion`, `otela --quic-congestion bbr|cubic|new-reno`).
+- QUIC uses quinn's BBR by default (`Config::quic: QuicTuning`, `otela --congestion bbr|cubic`, plus `--stream-window-mib`).
   It runs in user space, so it works on hosts without the kernel bbr module and without root. The relay and
   rendezvous request kernel `bbr` on their own sockets and silently keep the default when it isn't loaded.
   The system-wide default is not touched. `PathReport::congestion` records what our end used.

@@ -5,7 +5,6 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use quinn::congestion;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::AlwaysResolvesClientRawPublicKeys;
@@ -27,7 +26,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::{client, server, TlsAcceptor, TlsConnector};
 
 use crate::identity::{Keypair, PeerId, TrustPolicy};
-use crate::stream::QuicCongestion;
 use crate::Error;
 
 pub(crate) const ALPN_PEER: &[u8] = b"otela/peer/1";
@@ -215,7 +213,8 @@ pub(crate) struct Tls {
     key: Arc<CertifiedKey>,
     trust: Arc<TrustPolicy>,
     provider: Arc<CryptoProvider>,
-    congestion: QuicCongestion,
+    transport: Arc<quinn::TransportConfig>,
+    congestion: Congestion,
 }
 
 impl Tls {
@@ -231,16 +230,18 @@ impl Tls {
             key,
             trust: Arc::new(trust),
             provider,
-            congestion: QuicCongestion::default(),
+            transport: quic_transport(&QuicTuning::default()),
+            congestion: Congestion::default(),
         })
     }
 
-    pub(crate) fn with_quic_congestion(mut self, congestion: QuicCongestion) -> Self {
-        self.congestion = congestion;
+    pub(crate) fn with_quic(mut self, tuning: &QuicTuning) -> Self {
+        self.transport = quic_transport(tuning);
+        self.congestion = tuning.congestion;
         self
     }
 
-    pub(crate) fn quic_congestion(&self) -> QuicCongestion {
+    pub(crate) fn quic_congestion(&self) -> Congestion {
         self.congestion
     }
 
@@ -287,7 +288,7 @@ impl Tls {
         let crypto = QuicClientConfig::try_from(self.client_config(expect, alpn))
             .expect("TLS 1.3 with AES-128-GCM is configured");
         let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-        config.transport_config(quic_transport(self.congestion));
+        config.transport_config(self.transport.clone());
         config
     }
 
@@ -295,7 +296,7 @@ impl Tls {
         let crypto = QuicServerConfig::try_from(self.server_config(alpns))
             .expect("TLS 1.3 with AES-128-GCM is configured");
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-        config.transport_config(quic_transport(self.congestion));
+        config.transport_config(self.transport.clone());
         config
     }
 
@@ -336,25 +337,53 @@ impl Tls {
     }
 }
 
+/// QUIC congestion controller. quinn runs it in userspace, so a host whose kernel has no BBR can still use it.
+/// BBR is the default: on lossy long paths loss-based control collapses (cubic moved 0.5-0.8 MB/s where BBR
+/// moved 18-20 MB/s on one).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Congestion {
+    Cubic,
+    #[default]
+    Bbr,
+}
+
+impl Congestion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cubic => "cubic",
+            Self::Bbr => "bbr",
+        }
+    }
+}
+
+/// QUIC settings a node may change: the congestion controller and the per-stream receive window.
+#[derive(Debug, Clone)]
+pub struct QuicTuning {
+    pub congestion: Congestion,
+    /// Bytes one stream may have in flight; one stream carries at most this per RTT. See `quic_transport`.
+    pub stream_window: u32,
+}
+
+impl Default for QuicTuning {
+    fn default() -> Self {
+        Self {
+            congestion: Congestion::default(),
+            stream_window: 2 << 20,
+        }
+    }
+}
+
 /// Keepalives refresh NAT bindings. quinn closes a connection whose stream has more than 1024 reassembly gaps;
 /// a 2 MiB stream window (~870 alternating lost packets) cannot reach that, where 16 MiB did under loss bursts
 /// at a 2.5 GbE bottleneck. One stream then carries at most 2 MiB per RTT, so bulk transfers use several.
-fn quic_transport(congestion: QuicCongestion) -> Arc<quinn::TransportConfig> {
+fn quic_transport(tuning: &QuicTuning) -> Arc<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
-    match congestion {
-        QuicCongestion::Bbr => {
-            transport.congestion_controller_factory(Arc::new(congestion::BbrConfig::default()))
-        }
-        QuicCongestion::Cubic => {
-            transport.congestion_controller_factory(Arc::new(congestion::CubicConfig::default()))
-        }
-        QuicCongestion::NewReno => {
-            transport.congestion_controller_factory(Arc::new(congestion::NewRenoConfig::default()))
-        }
-    };
+    if tuning.congestion == Congestion::Bbr {
+        transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    }
     transport
         .max_concurrent_bidi_streams(1024u32.into())
-        .stream_receive_window((2u32 << 20).into())
+        .stream_receive_window(tuning.stream_window.into())
         .receive_window((128u32 << 20).into())
         .send_window(128 << 20)
         .keep_alive_interval(Some(Duration::from_secs(5)))

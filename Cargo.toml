@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/opentela-core"]
+members = ["crates/opentela-core", "crates/opentela-bin"]
 
 [workspace.package]
 version = "0.1.0"

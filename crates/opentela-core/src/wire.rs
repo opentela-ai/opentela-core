@@ -50,6 +50,14 @@ fn dedup(addrs: impl Iterator<Item = SocketAddr>) -> Vec<SocketAddr> {
     out
 }
 
+/// What a raw circuit connection asks the relay for; signed by the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum Purpose {
+    Dial { target: PeerId },
+    Accept { circuit: u64 },
+}
+
 /// One dial-back result: could the rendezvous reach us, from another port, at an address it observed for us?
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DialBack {
@@ -106,15 +114,23 @@ pub(crate) enum Msg {
     },
     Reserve,
     Reserved,
-    Dial {
-        target: PeerId,
-    },
     Circuit {
         from: PeerId,
         circuit: u64,
     },
-    Accept {
-        circuit: u64,
+    /// Raw circuit admission (see `circuit.rs`); nonces and signatures are hex.
+    CircuitHello {
+        from: PeerId,
+        nonce: String,
+    },
+    CircuitChallenge {
+        relay: PeerId,
+        nonce: String,
+        signature: String,
+    },
+    CircuitAuth {
+        purpose: Purpose,
+        signature: String,
     },
     Spliced,
     Ping,

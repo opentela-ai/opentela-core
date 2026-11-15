@@ -14,12 +14,12 @@ use crate::identity::PeerId;
 use crate::net::{connect_tcp, tcp_congestion};
 use crate::node::{Inner, Node};
 use crate::punch::{punch_socket, sim_open, spray};
-use crate::services::resolve;
+use crate::services::open_circuit;
 use crate::stream::{
     Attempt, Outcome, PathKind, PathReport, Stream, Transport, HELLO_PROBE, HELLO_STREAM,
 };
-use crate::tls::{quic_identity, ChannelBinding, Congestion, Expect, ALPN_PEER, ALPN_RELAY};
-use crate::wire::{read_frame, write_frame, Msg, Record};
+use crate::tls::{quic_identity, ChannelBinding, Congestion, Expect, ALPN_PEER};
+use crate::wire::{Msg, Purpose, Record};
 use crate::{Error, Step};
 
 /// Staggered QUIC dials during a punch: each new Initial is another chance once the far NAT opens.
@@ -501,59 +501,38 @@ async fn relay(
 }
 
 async fn relay_via(inner: &Inner, peer: PeerId, addr: &str) -> Result<Established, Error> {
-    let mut last = None;
-    for remote in resolve(inner, addr).await? {
-        let attempt = async {
-            let tcp = connect_tcp(None, remote, inner.timeouts.control).await?;
-            let congestion = tcp_congestion(&tcp);
-            let (mut outer, _, _) = inner
-                .tls
-                .connect(tcp, Expect::AnyTrusted, ALPN_RELAY)
-                .await?;
-            write_frame(&mut outer, 1, Msg::Dial { target: peer }).await?;
-            match read_frame(&mut outer).await?.msg {
-                Msg::Spliced => {}
-                Msg::Error { message } => return Err(Error::Remote(message)),
-                other => return Err(Error::Protocol(format!("expected spliced, got {other:?}"))),
-            }
-            let started = Instant::now();
-            let (tls, _, binding) = inner
-                .tls
-                .connect(outer, Expect::Peer(peer), ALPN_PEER)
-                .await?;
-            let rtt_ms = started.elapsed().as_secs_f64() * 1e3;
-            let kind = PathKind::Relayed;
-            let stream = Stream {
-                io: Box::new(tls),
-                peer,
-                binding,
-                kind,
-                transport: Transport::Tcp,
-            };
-            let route = Route::Relay(addr.to_string());
-            let report = PathReport {
-                peer,
-                kind,
-                transport: Transport::Tcp,
-                via: addr.to_string(),
-                rtt_ms,
-                congestion,
-                throughput_bps: None,
-                attempts: Vec::new(),
-            };
-            Ok(Established {
-                route,
-                binding,
-                report,
-                stream: Some(stream),
-            })
-        };
-        match attempt.await {
-            Ok(established) => return Ok(established),
-            Err(e) => last = Some(e),
-        }
-    }
-    Err(last.expect("resolve returns at least one address"))
+    let raw = open_circuit(inner, addr, Purpose::Dial { target: peer }).await?;
+    let congestion = tcp_congestion(&raw);
+    let started = Instant::now();
+    let (tls, _, binding) = inner
+        .tls
+        .connect(raw, Expect::Peer(peer), ALPN_PEER)
+        .await?;
+    let rtt_ms = started.elapsed().as_secs_f64() * 1e3;
+    let kind = PathKind::Relayed;
+    let stream = Stream {
+        io: Box::new(tls),
+        peer,
+        binding,
+        kind,
+        transport: Transport::Tcp,
+    };
+    let report = PathReport {
+        peer,
+        kind,
+        transport: Transport::Tcp,
+        via: addr.to_string(),
+        rtt_ms,
+        congestion,
+        throughput_bps: None,
+        attempts: Vec::new(),
+    };
+    Ok(Established {
+        route: Route::Relay(addr.to_string()),
+        binding,
+        report,
+        stream: Some(stream),
+    })
 }
 
 /// Opens a circuit to ourselves through one relay and round-trips an empty probe: proves the reservation,

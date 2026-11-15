@@ -1,5 +1,7 @@
-//! Relay server: splices two TLS connections from trusted peers into a circuit. Peers run their own TLS session
-//! end to end inside the circuit, so the relay forwards ciphertext and cannot impersonate either side.
+//! Relay server. Reservations are TLS control sessions. A circuit joins two raw TCP connections whose owners
+//! proved their keys in a signed preamble (`circuit.rs`); after that the relay copies bytes without decrypting
+//! anything. The peers run their own TLS session end to end inside, so the relay sees ciphertext only and
+//! cannot impersonate either side. Both kinds share one port, told apart by the first byte.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -14,11 +16,12 @@ use tokio::task::JoinSet;
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, info};
 
+use crate::circuit::MAGIC;
 use crate::control::{self, Cleanup, Sessions};
 use crate::identity::{Keypair, PeerId, TrustPolicy};
 use crate::net::{bind_tcp, prefer_bbr, tune};
 use crate::tls::{Tls, ALPN_RELAY};
-use crate::wire::{read_frame, write_frame, Msg};
+use crate::wire::{read_frame, write_frame, Msg, Purpose};
 use crate::Error;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -56,7 +59,7 @@ pub struct RelayConfig {
     pub limits: RelayLimits,
 }
 
-type Conn = TlsStream<TcpStream>;
+type Conn = TcpStream;
 
 #[derive(Default)]
 struct State {
@@ -67,6 +70,7 @@ struct State {
 
 struct Shared {
     tls: Tls,
+    key: Keypair,
     limits: RelayLimits,
     state: Mutex<State>,
     ids: AtomicU64,
@@ -85,6 +89,7 @@ impl RelayServer {
         let circuits = Arc::new(Semaphore::new(config.limits.max_circuits));
         let shared = Arc::new(Shared {
             tls,
+            key: config.keypair,
             limits: config.limits,
             state: Mutex::default(),
             ids: AtomicU64::new(1),
@@ -126,32 +131,59 @@ impl RelayServer {
 
 async fn connection(
     shared: Arc<Shared>,
-    stream: TcpStream,
+    mut stream: TcpStream,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<(), Error> {
     tune(&stream)?;
     prefer_bbr(&stream);
-    let first = async {
-        let (mut conn, peer, _, _) = shared.tls.accept(stream, &[ALPN_RELAY]).await?;
-        let frame = read_frame(&mut conn).await?;
-        Ok::<_, Error>((conn, peer, frame))
-    };
-    let (mut conn, peer, frame) = tokio::time::timeout(HANDSHAKE_TIMEOUT, first)
+    let mut first = [0u8; 1];
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.peek(&mut first))
         .await
         .map_err(|_| Error::Timeout("relay handshake"))??;
+    if first[0] != MAGIC[0] {
+        let reservation = async {
+            let (mut conn, peer, _, _) = shared.tls.accept(stream, &[ALPN_RELAY]).await?;
+            let frame = read_frame(&mut conn).await?;
+            Ok::<_, Error>((conn, peer, frame))
+        };
+        let (mut conn, peer, frame) = tokio::time::timeout(HANDSHAKE_TIMEOUT, reservation)
+            .await
+            .map_err(|_| Error::Timeout("relay handshake"))??;
+        drop(permit);
+        return match frame.msg {
+            Msg::Reserve => reserve(&shared, conn, peer, frame.id).await,
+            other => {
+                write_frame(
+                    &mut conn,
+                    frame.id,
+                    Msg::error("TLS sessions only hold reservations"),
+                )
+                .await?;
+                Err(Error::Protocol(format!(
+                    "unexpected first frame {}",
+                    other.kind()
+                )))
+            }
+        };
+    }
+    let (peer, purpose) = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        crate::circuit::admit(&mut stream, &shared.key, shared.tls.trust()),
+    )
+    .await
+    .map_err(|_| Error::Timeout("circuit preamble"))??;
     drop(permit);
-    match frame.msg {
-        Msg::Reserve => reserve(&shared, conn, peer, frame.id).await,
-        Msg::Dial { target } => match circuit(&shared, &mut conn, peer, target).await {
+    match purpose {
+        Purpose::Dial { target } => match circuit(&shared, &mut stream, peer, target).await {
             Ok(()) => Ok(()),
             Err(e) => {
-                write_frame(&mut conn, frame.id, Msg::error(e.to_string()))
+                write_frame(&mut stream, 0, Msg::error(e.to_string()))
                     .await
                     .ok();
                 Err(e)
             }
         },
-        Msg::Accept { circuit } => {
+        Purpose::Accept { circuit } => {
             let waiter = {
                 let mut state = shared.state.lock().expect("state lock");
                 match state.pending.remove(&circuit) {
@@ -166,12 +198,12 @@ async fn connection(
             };
             match waiter {
                 Some(waiter) => waiter
-                    .send(conn)
+                    .send(stream)
                     .map_err(|_| Error::Remote("dialer gave up".into())),
                 None => {
                     write_frame(
-                        &mut conn,
-                        frame.id,
+                        &mut stream,
+                        0,
                         Msg::error(format!("no circuit {circuit} for you")),
                     )
                     .await?;
@@ -181,14 +213,15 @@ async fn connection(
                 }
             }
         }
-        other => Err(Error::Protocol(format!(
-            "unexpected first frame {}",
-            other.kind()
-        ))),
     }
 }
 
-async fn reserve(shared: &Arc<Shared>, mut conn: Conn, peer: PeerId, id: u64) -> Result<(), Error> {
+async fn reserve(
+    shared: &Arc<Shared>,
+    mut conn: TlsStream<TcpStream>,
+    peer: PeerId,
+    id: u64,
+) -> Result<(), Error> {
     let session = shared.ids.fetch_add(1, Ordering::Relaxed);
     let (push, pushes) = mpsc::channel(64);
     let admitted = {

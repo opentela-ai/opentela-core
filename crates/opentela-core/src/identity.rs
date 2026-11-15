@@ -9,7 +9,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use ring::rand::SystemRandom;
-use ring::signature::{Ed25519KeyPair, KeyPair};
+use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::Error;
@@ -35,6 +35,13 @@ impl PeerId {
     /// The RFC 7250 raw public key presented in TLS.
     pub(crate) fn to_spki(self) -> Vec<u8> {
         [&ED25519_SPKI_PREFIX[..], &self.0].concat()
+    }
+
+    /// True iff `signature` is this key's Ed25519 signature over `message`.
+    pub(crate) fn verifies(&self, message: &[u8], signature: &[u8]) -> bool {
+        UnparsedPublicKey::new(&ED25519, self.0)
+            .verify(message, signature)
+            .is_ok()
     }
 
     /// Parses a raw public key; anything but an Ed25519 SPKI is rejected.
@@ -136,6 +143,15 @@ impl Keypair {
 
     pub(crate) fn pkcs8(&self) -> &[u8] {
         &self.pkcs8
+    }
+
+    pub(crate) fn sign(&self, message: &[u8]) -> [u8; 64] {
+        let pair = Ed25519KeyPair::from_pkcs8_maybe_unchecked(&self.pkcs8)
+            .expect("the PKCS#8 bytes parsed when the key was made");
+        pair.sign(message)
+            .as_ref()
+            .try_into()
+            .expect("Ed25519 signatures are 64 bytes")
     }
 }
 

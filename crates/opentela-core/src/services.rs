@@ -18,7 +18,7 @@ use crate::node::{dispatch, Inner, HANDSHAKE_TIMEOUT};
 use crate::punch::{respond_tcp_punch, respond_udp_punch};
 use crate::stream::{PathKind, Transport};
 use crate::tls::{Expect, ALPN_PEER, ALPN_RELAY, ALPN_RENDEZVOUS};
-use crate::wire::{read_frame, write_frame, Msg};
+use crate::wire::{read_frame, write_frame, Msg, Purpose};
 use crate::Error;
 
 const BACKOFF_MIN: Duration = Duration::from_millis(250);
@@ -266,15 +266,13 @@ async fn accept_circuit(
         return Err(Error::Untrusted(from));
     }
     let setup = async {
-        let (mut outer, _, _) =
-            dial_service(inner, &inner.relays[relay].addr, None, ALPN_RELAY).await?;
-        write_frame(&mut outer, 1, Msg::Accept { circuit }).await?;
-        match read_frame(&mut outer).await?.msg {
-            Msg::Spliced => {}
-            Msg::Error { message } => return Err(Error::Remote(message)),
-            other => return Err(Error::Protocol(format!("expected spliced, got {other:?}"))),
-        }
-        let (stream, peer, binding, _) = inner.tls.accept(outer, &[ALPN_PEER]).await?;
+        let raw = open_circuit(
+            inner,
+            &inner.relays[relay].addr,
+            Purpose::Accept { circuit },
+        )
+        .await?;
+        let (stream, peer, binding, _) = inner.tls.accept(raw, &[ALPN_PEER]).await?;
         Ok::<_, Error>((stream, peer, binding))
     };
     let (stream, peer, binding) = tokio::time::timeout(HANDSHAKE_TIMEOUT, setup)
@@ -289,4 +287,33 @@ async fn accept_circuit(
         Transport::Tcp,
     )
     .await
+}
+
+/// A raw TCP connection to a relay, admitted for `purpose` by the signed preamble and spliced: from here on it
+/// carries only the peers' own TLS.
+pub(crate) async fn open_circuit(
+    inner: &Inner,
+    addr: &str,
+    purpose: Purpose,
+) -> Result<TcpStream, Error> {
+    let mut last = None;
+    for remote in resolve(inner, addr).await? {
+        let attempt = async {
+            let mut tcp = connect_tcp(None, remote, inner.timeouts.control).await?;
+            crate::circuit::open(&mut tcp, &inner.key, inner.tls.trust(), purpose).await?;
+            match read_frame(&mut tcp).await?.msg {
+                Msg::Spliced => Ok(tcp),
+                Msg::Error { message } => Err(Error::Remote(message)),
+                other => Err(Error::Protocol(format!(
+                    "expected spliced, got {}",
+                    other.kind()
+                ))),
+            }
+        };
+        match attempt.await {
+            Ok(tcp) => return Ok(tcp),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.expect("resolve returns at least one address"))
 }

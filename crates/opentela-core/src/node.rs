@@ -124,6 +124,8 @@ impl Slot {
 pub(crate) struct Inner {
     pub id: PeerId,
     pub tls: Tls,
+    /// Signs relay circuit preambles.
+    pub key: Keypair,
     pub quic: quinn::Endpoint,
     /// Same socket as the QUIC endpoint; used to spray punch packets.
     pub udp: std::net::UdpSocket,
@@ -161,6 +163,7 @@ impl Node {
         let inner = Arc::new(Inner {
             id: config.keypair.peer_id(),
             tls,
+            key: config.keypair,
             quic,
             udp,
             local,

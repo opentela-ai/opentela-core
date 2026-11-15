@@ -4,6 +4,7 @@
 //! a [`Connection`] that opens authenticated, end-to-end encrypted [`Stream`]s; [`Node::accept`] yields the
 //! streams peers open to us. [`RendezvousServer`] and [`RelayServer`] are the two always-on services.
 
+mod circuit;
 mod connect;
 mod control;
 mod identity;

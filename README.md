@@ -48,8 +48,9 @@ attempt goes into `PathReport::attempts`:
 back their observed TCP address. A QUIC connection from the listen socket reports the observed UDP address,
 and its keepalives hold the NAT binding open. All state is soft: after a restart, peers reconnect with
 backoff and register again. `DialBackRequest` makes the rendezvous dial the peer from a different port,
-over TCP and over QUIC. A reply from the port the peer contacted would pass a stateful firewall and prove
-nothing.
+over TCP and over QUIC. It dials only the addresses it observed for the peer, never ones the peer
+supplied, and it answers with one boolean per address. A reply from the port the peer contacted would
+pass a stateful firewall and prove nothing.
 
 **Relay** (`relay` binary, default port 443). A peer holds a reservation, which is a long-lived control
 session. To reach it, a dialer opens a TCP+TLS connection and sends `Dial{target}`. The relay pushes
@@ -71,6 +72,7 @@ never queues.
 | A second process with the same key (a preflight next to the daemon, or a restart racing the old process) | Servers keep a stack of sessions per peer. The newest one serves, and the older one takes over again when the newer one ends |
 | A cancelled dial | Helper tasks live in `JoinSet`s, so a timed-out step leaks no sessions or sockets |
 | Errors | `Error::NoPath` lists every step with its outcome. Remote error frames come back as `Error::Remote` |
+| Abuse by an allow-listed peer | Frames are capped at 64 KiB. Error frames carry fixed text of at most 256 bytes, never peer content. A registration keeps at most 8 advertised addresses (no unspecified, multicast, broadcast or port 0) and at most 8 relay names. Dial-back only targets addresses the rendezvous observed itself. UDP spraying goes to at most 4 targets, observed address first, with one active spray per peer. Registry cleanup runs in drop guards, so a panicking handler cannot leak slots |
 
 ## API
 
@@ -85,7 +87,7 @@ let node = Node::start(config).await?;
 
 // Dialing side
 let conn = node.connect(peer_id).await?;            // walks the ladder
-let report = conn.report();                          // {kind: direct|punched|relayed, transport, via, rtt_ms, throughput_bps, attempts}
+let report = conn.report();                          // {kind: direct|punched|relayed, transport, via, rtt_ms, congestion, throughput_bps, attempts}
 let mut streams = Vec::new();
 for _ in 0..4 { streams.push(conn.open_stream().await?); }   // parallel streams for bulk transfer
 conn.measure(1 << 30, 4).await?;                     // iperf-style probe; sets report.throughput_bps
@@ -133,12 +135,36 @@ $B/otela bench --key node-a.key --allow allow.txt --rendezvous ... --relay ... \
 `OTELA_KEY`, `OTELA_ALLOW`, `OTELA_RENDEZVOUS` and `OTELA_RELAYS` can stand in for the matching flags.
 Logging uses `tracing` and goes to stderr, filtered by `RUST_LOG` (default `info`).
 
-Binding port 443 needs root or `CAP_NET_BIND_SERVICE` (`setcap cap_net_bind_service=+ep target/release/relay`).
+Binding port 443 needs root or `CAP_NET_BIND_SERVICE`.
+
+### systemd
+
+`deploy/systemd/` has the two units. They run under `DynamicUser`, read their key and allow list through
+`LoadCredential`, get `CAP_NET_BIND_SERVICE` for 443, and cap memory with `MemoryMax`. To install them:
+
+```sh
+install -m755 target/release/{rendezvous,relay,otela} /usr/local/bin/
+mkdir -m700 /etc/opentela && cd /etc/opentela
+otela keygen --out rendezvous.key; otela keygen --out relay.key   # add both ids to allow.txt
+cp allow.txt /etc/opentela/allow.txt
+cp deploy/systemd/otela-*.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now otela-rendezvous otela-relay
+```
+
+The rendezvous listens on TCP+UDP 8443 and the relay on TCP 443. To stop and remove them:
+
+```sh
+systemctl disable --now otela-rendezvous otela-relay
+rm /etc/systemd/system/otela-{rendezvous,relay}.service && systemctl daemon-reload
+rm -r /etc/opentela /usr/local/bin/{rendezvous,relay,otela}
+```
+
+A changed allow list takes effect after `systemctl restart otela-rendezvous otela-relay`.
 
 ## Tests
 
 ```sh
-cargo test        # 9 unit + 8 in-process integration tests over loopback
+cargo test        # 14 unit + 9 in-process integration tests over loopback
 ```
 
 The integration tests (`crates/opentela-core/tests/ladder.rs`) cover:
@@ -152,50 +178,63 @@ The integration tests (`crates/opentela-core/tests/ladder.rs`) cover:
 - The relay's per-peer circuit limit and idle timeout.
 - A preflight that reports dead services.
 - A second process with the same key leaving the first one registered.
+- The rendezvous never dialing a client-advertised address during dial-back.
+
+Unit tests cover the hardening: oversized outgoing frames return an error instead of panicking, error text
+is capped on both sides, registrations are capped and filtered, punch targets are capped, and cleanup
+guards run on panic.
 
 Loopback can't exercise real NAT filtering; the real-host runs below do.
 
 ## Measured on real hosts (2026-11-15)
 
-Test bed:
+Primary rendezvous and relay: 85.90.245.236. It is a public IP on eth0 with no NAT, 1 vCPU and 2 GB RAM,
+and runs the systemd units above: rendezvous on TCP+UDP 8443, relay on TCP 443, with kernel bbr on their
+own sockets. ocf-1 was not used.
 
-- ds6 (aarch64, 129.132.102.36, 2.5 GbE) runs the rendezvous on 7400 and two relays on 8443 and 8444. 443
-  needs root there.
-- sgs-gpu07 (x86_64, 172.25.4.17) reaches ds6 on a routed path with no NAT. Its inbound TCP is refused by
-  its firewall, and stateful UDP is allowed. Its NAT towards the internet keeps the port (STUN:
-  195.176.103.148, same port to three servers).
-- CSCS compute nodes on beverin (mi200) and clariden (debug).
+`otela bench` runs twice per cell, 256 MiB from mit3090 and 512 MiB from CSCS. Throughput is shown as
+`run1/run2` in Gbit/s. RTT is the minimum QUIC RTT, or the TLS handshake time on TCP. The channel-binding
+echo matched on both ends in every run. Congestion control (cc) is our end's: `quic:bbr` is quinn's BBR
+(the new default), and `tcp:cubic` is the hosts' kernel default (they have no bbr module).
 
-`otela bench` moves 1 GiB over 8 streams twice per step. The channel-binding echo matched on both ends in
-every run.
+| Pair | Full ladder picks | cc | RTT | 1 stream | 4 streams | 8 streams |
+| --- | --- | --- | --- | --- | --- | --- |
+| clariden compute (aarch64) → sgs-gpu07 | relay (direct, UDP and TCP punch fail) | tcp:cubic | 16 ms | 3.06/2.28 | 3.11/2.45 | 2.66/2.47 |
+| beverin compute (mi200) → sgs-gpu07 | relay (same) | tcp:cubic | 16.5 ms | 3.11/2.23 | 3.05/2.49 | 2.88/2.72 |
+| mit3090 → sgs-gpu07 | UDP punch (QUIC) | quic:bbr | 81 ms | 0.18/0.18 | 0.57/0.57 | 0.67/0.90 |
+| mit3090 → sgs-gpu07, TCP punch forced | TCP punch | tcp:cubic | 84 ms | 0.26/0.26 | 0.70/0.70 | 0.76/0.75 |
+| mit3090 → sgs-gpu07, relay forced | relay | tcp:cubic | 96 ms | 0.24/0.25 | 0.48/0.56 | 0.64/0.63 |
+| mit3090 → ds6 | UDP punch (QUIC) | quic:bbr | 81 ms | 0.17/0.18 | 0.56/0.72 | 0.68/0.90 |
+| mit3090 → ds6, TCP punch forced | TCP punch | tcp:cubic | 84 ms | 0.26/0.26 | 0.62/0.54 | 0.63/0.76 |
+| mit3090 → ds6, relay forced | relay | tcp:cubic | 95 ms | 0.24/0.24 | 0.54/0.69 | 0.72/0.45 |
+| ds6 → sgs-gpu07, relay forced | relay | tcp:cubic | 15 ms | 1.98–2.11 | – | 1.4–2.2 (6 runs) |
+| sgs-gpu07 ↔ ds6 (inside ETH, before the VM) | direct / UDP punch | – | 0.15 ms | – | – | 2.23–2.35, line rate of ds6's 2.5 GbE |
 
-| From → to | Direct | UDP punch (QUIC) | TCP punch | Relay (ds6) | Full ladder picks |
-| --- | --- | --- | --- | --- | --- |
-| sgs-gpu07 → ds6 | QUIC 2.23–2.30 Gbit/s, 0.15 ms | 2.23–2.27 Gbit/s | 2.34 Gbit/s, 1.0 ms | 2.33 Gbit/s, 1.2 ms | direct (QUIC) |
-| ds6 → sgs-gpu07 | fails (firewall) | 2.29–2.33 Gbit/s, 0.2 ms | 2.35 Gbit/s, 1.1 ms | 2.35 Gbit/s, 1.0 ms | direct failed → UDP punch |
+Findings:
 
-All four steps reach the 2.5 GbE line rate of ds6, so this pair says nothing about relay CPU limits.
+- **CSCS compute nodes** on beverin and clariden leave through a NAT pool (148.187.0.208 and
+  148.187.0.212, one address per node). They reach the VM on TCP 443 and 8443. All UDP egress is blocked
+  (QUIC to the rendezvous and STUN to Google and Cloudflare both time out), so UDP punching is impossible.
+  TCP punching through the NAT pool was tried with the VM as rendezvous and failed every time (6 s
+  timeout, 1, 4 and 8 streams, both clusters). The pool keeps the listen port's mapping (`port
+  preserved`) but does not admit the peer's SYNs to fresh punch ports. CSCS ↔ anything therefore goes
+  through the relay, and the ladder reaches it in about 15 s.
+- **mit3090** (public, no NAT, firewalled inbound) and **sgs-gpu07** (port-preserving NAT) punch UDP to
+  each other, and TCP punching works too. ds6 also punches with mit3090, even though the ETH perimeter
+  refuses mit3090's unsolicited packets. A single QUIC stream is capped at 2 MiB per RTT, about 0.2
+  Gbit/s at 81 ms (see Decisions), so use 8 or more streams. The mit3090 path tops out near 0.9 Gbit/s
+  on every step.
+- **Relay CPU.** On the 1-vCPU VM the relay process ran at 67–83% mean CPU, peaking at 95–100%, while
+  moving 1.5–1.9 Gbit/s, with the VM shared by other services. Per byte it decrypts and re-encrypts the
+  outer TLS once per direction. So the VM's single core is the relay's ceiling at roughly 2–3 Gbit/s,
+  which is about what CSCS ↔ sgs-gpu07 reaches. A second vCPU, or dropping the outer TLS on circuits
+  (the inner TLS is end to end anyway), would raise it. RSS stays around 11 MB.
+- **A real bug found here:** one in three relayed 8-stream transfers stalled for about 120 s. The relay
+  did not flush TLS after a write, so the tail of a burst sat in rustls until the idle timeout. This is
+  fixed with a regression test. Since the fix, 6 of 6 runs were clean.
 
-**CSCS compute nodes cannot reach ds6.** TCP to ds6 on 7400, 8443 and even 22 times out from beverin and
-clariden login nodes, and from beverin compute nodes. The ETH perimeter admits ds6's high ports only from
-inside ETH (even the operator's laptop on 195.176.113.253 is refused). So ds6 never sees a CSCS source
-address. Measured instead:
-
-- NAT and egress. Beverin compute nodes leave through 148.187.0.208 and 148.187.0.212, a NAT pool that
-  differs per node. The clariden login node leaves through 148.187.6.106. Outbound TCP to arbitrary internet
-  ports (443, 8443) works. Outbound UDP from beverin compute nodes is blocked (STUN to Google and Cloudflare
-  times out), so QUIC punching cannot work from there. From CSCS compute nodes only the relay step over
-  TCP is viable.
-- Paths through a stand-in relay. To get numbers anyway, a relay ran briefly on the CSCS login node, which
-  compute nodes reach internally. sgs-gpu07 reached it through an SSH tunnel via the operator's laptop
-  (sgs → laptop → CSCS login). The relay path then worked end to end, with matching channel bindings:
-  beverin compute ↔ sgs-gpu07 at 0.82–0.92 Gbit/s over 1, 4 or 8 streams. The tunnel is the bottleneck, so
-  this proves function, not capacity.
-
-**What a public VM changes.** It would run the rendezvous and relays on 443 (TCP) and UDP, reachable from
-CSCS compute nodes and from ETH. CSCS ↔ ETH would then go over the relay at the VM's bandwidth, with no
-tunnel. Punching from CSCS compute nodes stays impossible while their UDP egress is blocked. TCP punching
-might work through the CSCS NAT pool, but it is untested.
+Before the VM, ds6 (inside ETH) could not be reached from CSCS, from mit3090 or from the operator's
+laptop on any port, including 22, 443 and UDP. Only hosts inside ETH such as sgs-gpu07 got through.
 
 ## Decisions taken here
 
@@ -212,6 +251,10 @@ might work through the CSCS NAT pool, but it is untested.
   limit of 1024 reassembly gaps, and quinn then kills the connection (seen at 16 and 64 MiB). One QUIC stream
   therefore carries at most 2 MiB per RTT, so bulk transfers should use several streams. The connection
   window is 128 MiB.
+- QUIC uses quinn's BBR by default (`Config::quic_congestion`, `otela --quic-congestion bbr|cubic|new-reno`).
+  It runs in user space, so it works on hosts without the kernel bbr module and without root. The relay and
+  rendezvous request kernel `bbr` on their own sockets and silently keep the default when it isn't loaded.
+  The system-wide default is not touched. `PathReport::congestion` records what our end used.
 - On QUIC, `PathReport::rtt_ms` is quinn's minimum RTT, because the smoothed RTT under load measures
   queueing. On TCP paths it is the duration of the TLS handshake.
 - On the accepting side, `Punched` means the peer asked us to punch within the last 60 s.

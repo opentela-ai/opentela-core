@@ -155,6 +155,48 @@ The integration tests (`crates/opentela-core/tests/ladder.rs`) cover:
 
 Loopback can't exercise real NAT filtering; the real-host runs below do.
 
+## Measured on real hosts (2026-11-15)
+
+Test bed:
+
+- ds6 (aarch64, 129.132.102.36, 2.5 GbE) runs the rendezvous on 7400 and two relays on 8443 and 8444. 443
+  needs root there.
+- sgs-gpu07 (x86_64, 172.25.4.17) reaches ds6 on a routed path with no NAT. Its inbound TCP is refused by
+  its firewall, and stateful UDP is allowed. Its NAT towards the internet keeps the port (STUN:
+  195.176.103.148, same port to three servers).
+- CSCS compute nodes on beverin (mi200) and clariden (debug).
+
+`otela bench` moves 1 GiB over 8 streams twice per step. The channel-binding echo matched on both ends in
+every run.
+
+| From → to | Direct | UDP punch (QUIC) | TCP punch | Relay (ds6) | Full ladder picks |
+| --- | --- | --- | --- | --- | --- |
+| sgs-gpu07 → ds6 | QUIC 2.23–2.30 Gbit/s, 0.15 ms | 2.23–2.27 Gbit/s | 2.34 Gbit/s, 1.0 ms | 2.33 Gbit/s, 1.2 ms | direct (QUIC) |
+| ds6 → sgs-gpu07 | fails (firewall) | 2.29–2.33 Gbit/s, 0.2 ms | 2.35 Gbit/s, 1.1 ms | 2.35 Gbit/s, 1.0 ms | direct failed → UDP punch |
+
+All four steps reach the 2.5 GbE line rate of ds6, so this pair says nothing about relay CPU limits.
+
+**CSCS compute nodes cannot reach ds6.** TCP to ds6 on 7400, 8443 and even 22 times out from beverin and
+clariden login nodes, and from beverin compute nodes. The ETH perimeter admits ds6's high ports only from
+inside ETH (even the operator's laptop on 195.176.113.253 is refused). So ds6 never sees a CSCS source
+address. Measured instead:
+
+- NAT and egress. Beverin compute nodes leave through 148.187.0.208 and 148.187.0.212, a NAT pool that
+  differs per node. The clariden login node leaves through 148.187.6.106. Outbound TCP to arbitrary internet
+  ports (443, 8443) works. Outbound UDP from beverin compute nodes is blocked (STUN to Google and Cloudflare
+  times out), so QUIC punching cannot work from there. From CSCS compute nodes only the relay step over
+  TCP is viable.
+- Paths through a stand-in relay. To get numbers anyway, a relay ran briefly on the CSCS login node, which
+  compute nodes reach internally. sgs-gpu07 reached it through an SSH tunnel via the operator's laptop
+  (sgs → laptop → CSCS login). The relay path then worked end to end, with matching channel bindings:
+  beverin compute ↔ sgs-gpu07 at 0.82–0.92 Gbit/s over 1, 4 or 8 streams. The tunnel is the bottleneck, so
+  this proves function, not capacity.
+
+**What a public VM changes.** It would run the rendezvous and relays on 443 (TCP) and UDP, reachable from
+CSCS compute nodes and from ETH. CSCS ↔ ETH would then go over the relay at the VM's bandwidth, with no
+tunnel. Punching from CSCS compute nodes stays impossible while their UDP egress is blocked. TCP punching
+might work through the CSCS NAT pool, but it is untested.
+
 ## Decisions taken here
 
 - Peer id is the raw public key, not a hash, so no lookup is needed to verify one.

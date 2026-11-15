@@ -140,7 +140,11 @@ async fn run(cli: Cli) -> Result<(), Error> {
                             "  dial-back {:?} {} -> {}",
                             d.transport,
                             d.addr,
-                            d.error.as_deref().unwrap_or("ok")
+                            if d.reachable {
+                                "reachable"
+                            } else {
+                                "unreachable"
+                            }
                         );
                     }
                 }

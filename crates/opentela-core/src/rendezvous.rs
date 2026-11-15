@@ -14,11 +14,11 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, info};
 
-use crate::control::{self, Sessions};
+use crate::control::{self, Cleanup, Sessions};
 use crate::identity::{Keypair, PeerId, TrustPolicy};
 use crate::net::{bind_tcp, bind_udp};
 use crate::tls::{quic_identity, Expect, Tls, ALPN_PEER, ALPN_RENDEZVOUS};
-use crate::wire::{read_frame, write_frame, DialBack, Msg, Record};
+use crate::wire::{read_frame, sanitize_registration, write_frame, DialBack, Msg, Record};
 use crate::{Error, Transport};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -145,15 +145,17 @@ async fn observe_udp(shared: Arc<Shared>, incoming: quinn::Incoming) {
             .expect("state lock")
             .udp_observed
             .insert(peer, id, addr);
+        let _observed = Cleanup::new(|| {
+            shared
+                .state
+                .lock()
+                .expect("state lock")
+                .udp_observed
+                .remove(&peer, id);
+        });
         write_frame(&mut send, 1, Msg::Observed { addr }).await?;
         // The client's keepalives hold this connection, and with it the NAT binding, open.
         conn.closed().await;
-        shared
-            .state
-            .lock()
-            .expect("state lock")
-            .udp_observed
-            .remove(&peer, id);
         Ok(())
     }
     .await;
@@ -175,15 +177,21 @@ async fn session(shared: &Arc<Shared>, stream: TcpStream, remote: SocketAddr) ->
     };
     let id = shared.sessions.fetch_add(1, Ordering::Relaxed);
     let (push, pushes) = mpsc::channel(64);
-    let error = control::serve(stream, pushes, |msg| {
+    let _registered = Cleanup::new(|| {
+        if shared
+            .state
+            .lock()
+            .expect("state lock")
+            .peers
+            .remove(&peer, id)
+        {
+            info!(%peer, "peer left");
+        }
+    });
+    control::serve(stream, pushes, |msg| {
         handle(shared, peer, id, remote, push.clone(), msg)
     })
-    .await;
-    let mut state = shared.state.lock().expect("state lock");
-    if state.peers.remove(&peer, id) {
-        info!(%peer, "peer left");
-    }
-    error
+    .await
 }
 
 async fn handle(
@@ -195,12 +203,14 @@ async fn handle(
     msg: Msg,
 ) -> Msg {
     match msg {
-        Msg::Register { listen, relays } => {
+        Msg::Register {
+            mut listen,
+            mut relays,
+        } => {
+            sanitize_registration(&mut listen, &mut relays);
             let mut state = shared.state.lock().expect("state lock");
             if !state.peers.contains(&peer) && state.peers.peers() >= shared.max_peers {
-                return Msg::Error {
-                    message: format!("rendezvous full ({} peers)", shared.max_peers),
-                };
+                return Msg::error(format!("rendezvous full ({} peers)", shared.max_peers));
             }
             let record = Record {
                 listen,
@@ -217,9 +227,7 @@ async fn handle(
         Msg::Lookup { target, punch } => {
             let state = shared.state.lock().expect("state lock");
             let (Some(record), Some(own)) = (state.record(&target), state.record(&peer)) else {
-                return Msg::Error {
-                    message: format!("peer {target} is not registered here"),
-                };
+                return Msg::error(format!("peer {target} is not registered here"));
             };
             if punch
                 && state
@@ -233,9 +241,7 @@ async fn handle(
                     })
                     .is_err()
             {
-                return Msg::Error {
-                    message: format!("peer {target} is not draining its session"),
-                };
+                return Msg::error(format!("peer {target} is not draining its session"));
             }
             Msg::Found { record }
         }
@@ -245,9 +251,7 @@ async fn handle(
             {
                 let mut state = shared.state.lock().expect("state lock");
                 let Some(registered) = state.peers.latest(&target) else {
-                    return Msg::Error {
-                        message: format!("peer {target} is not registered here"),
-                    };
+                    return Msg::error(format!("peer {target} is not registered here"));
                 };
                 if registered
                     .push
@@ -258,24 +262,21 @@ async fn handle(
                     })
                     .is_err()
                 {
-                    return Msg::Error {
-                        message: format!("peer {target} is not draining its session"),
-                    };
+                    return Msg::error(format!("peer {target} is not draining its session"));
                 }
                 state.tcp_punches.insert(token, (target, remote, answer_tx));
             }
-            let answered = tokio::time::timeout(PUNCH_ANSWER_TIMEOUT, answer).await;
-            shared
-                .state
-                .lock()
-                .expect("state lock")
-                .tcp_punches
-                .remove(&token);
-            match answered {
+            let _open = Cleanup::new(|| {
+                shared
+                    .state
+                    .lock()
+                    .expect("state lock")
+                    .tcp_punches
+                    .remove(&token);
+            });
+            match tokio::time::timeout(PUNCH_ANSWER_TIMEOUT, answer).await {
                 Ok(Ok(addr)) => Msg::PunchAddr { addr },
-                _ => Msg::Error {
-                    message: format!("peer {target} did not join the TCP punch"),
-                },
+                _ => Msg::error(format!("peer {target} did not join the TCP punch")),
             }
         }
         Msg::TcpPunchAnswer { token } => {
@@ -283,55 +284,37 @@ async fn handle(
             match state.tcp_punches.remove(&token) {
                 Some((target, initiator, answer)) if target == peer => match answer.send(remote) {
                     Ok(()) => Msg::PunchAddr { addr: initiator },
-                    Err(_) => Msg::Error {
-                        message: "the initiator gave up".into(),
-                    },
+                    Err(_) => Msg::error("the initiator gave up"),
                 },
                 Some(entry) => {
                     state.tcp_punches.insert(token, entry);
-                    Msg::Error {
-                        message: "punch token belongs to another peer".into(),
-                    }
+                    Msg::error("punch token belongs to another peer")
                 }
-                None => Msg::Error {
-                    message: "unknown or expired punch token".into(),
-                },
+                None => Msg::error("unknown or expired punch token"),
             }
         }
         Msg::DialBackRequest => {
             let Some(record) = shared.state.lock().expect("state lock").record(&peer) else {
-                return Msg::Error {
-                    message: "register before asking for a dial-back".into(),
-                };
+                return Msg::error("register before asking for a dial-back");
             };
             Msg::DialBackResult {
                 results: dial_back(shared, peer, &record).await,
             }
         }
-        other => Msg::Error {
-            message: format!("unexpected {other:?}"),
-        },
+        other => Msg::error(format!("unexpected {}", other.kind())),
     }
 }
 
-/// Tries to reach the peer from here at each of its addresses, as an unrelated host would.
+/// Tries to reach the peer from another port at the addresses this server observed for it, never at
+/// addresses the peer supplied: that would let a client aim the rendezvous at arbitrary hosts. The answer is
+/// one boolean per address; connect errors are not echoed back.
 async fn dial_back(shared: &Arc<Shared>, peer: PeerId, record: &Record) -> Vec<DialBack> {
+    let targets = record
+        .tcp_observed
+        .map(|a| (a, Transport::Tcp))
+        .into_iter()
+        .chain(record.udp_observed.map(|a| (a, Transport::Quic)));
     let mut probes = JoinSet::new();
-    let tcp = record
-        .listen
-        .iter()
-        .chain(&record.tcp_observed)
-        .map(|&a| (a, Transport::Tcp));
-    let mut targets: Vec<(SocketAddr, Transport)> = tcp
-        .chain(
-            record
-                .udp_candidates()
-                .into_iter()
-                .map(|a| (a, Transport::Quic)),
-        )
-        .collect();
-    targets.sort();
-    targets.dedup();
     for (addr, transport) in targets {
         let shared = shared.clone();
         probes.spawn(async move {
@@ -352,19 +335,18 @@ async fn dial_back(shared: &Arc<Shared>, peer: PeerId, record: &Record) -> Vec<D
                             .connect_with(config, addr, "otela")?
                             .await?;
                         conn.close(0u32.into(), b"dial-back");
-                        Ok(())
+                        Ok::<_, Error>(())
                     }
                 }
             };
-            let error = match tokio::time::timeout(DIAL_BACK_TIMEOUT, attempt).await {
-                Err(_) => Some("timed out".to_string()),
-                Ok(Err(e)) => Some(e.to_string()),
-                Ok(Ok(())) => None,
-            };
+            let reachable = matches!(
+                tokio::time::timeout(DIAL_BACK_TIMEOUT, attempt).await,
+                Ok(Ok(()))
+            );
             DialBack {
                 addr,
                 transport,
-                error,
+                reachable,
             }
         });
     }

@@ -14,7 +14,7 @@ use tokio::task::JoinSet;
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, info};
 
-use crate::control::{self, Sessions};
+use crate::control::{self, Cleanup, Sessions};
 use crate::identity::{Keypair, PeerId, TrustPolicy};
 use crate::net::{bind_tcp, tune};
 use crate::tls::{Tls, ALPN_RELAY};
@@ -144,15 +144,9 @@ async fn connection(
         Msg::Dial { target } => match circuit(&shared, &mut conn, peer, target).await {
             Ok(()) => Ok(()),
             Err(e) => {
-                write_frame(
-                    &mut conn,
-                    frame.id,
-                    Msg::Error {
-                        message: e.to_string(),
-                    },
-                )
-                .await
-                .ok();
+                write_frame(&mut conn, frame.id, Msg::error(e.to_string()))
+                    .await
+                    .ok();
                 Err(e)
             }
         },
@@ -177,9 +171,7 @@ async fn connection(
                     write_frame(
                         &mut conn,
                         frame.id,
-                        Msg::Error {
-                            message: format!("no circuit {circuit} for you"),
-                        },
+                        Msg::error(format!("no circuit {circuit} for you")),
                     )
                     .await?;
                     Err(Error::Protocol(format!(
@@ -188,7 +180,10 @@ async fn connection(
                 }
             }
         }
-        other => Err(Error::Protocol(format!("unexpected first frame {other:?}"))),
+        other => Err(Error::Protocol(format!(
+            "unexpected first frame {}",
+            other.kind()
+        ))),
     }
 }
 
@@ -209,28 +204,27 @@ async fn reserve(shared: &Arc<Shared>, mut conn: Conn, peer: PeerId, id: u64) ->
             "relay full ({} reservations)",
             shared.limits.max_reservations
         );
-        write_frame(
-            &mut conn,
-            id,
-            Msg::Error {
-                message: message.clone(),
-            },
-        )
-        .await?;
+        write_frame(&mut conn, id, Msg::error(message.clone())).await?;
         return Err(Error::Remote(message));
     }
+    let _reserved = Cleanup::new(|| {
+        if shared
+            .state
+            .lock()
+            .expect("state lock")
+            .reservations
+            .remove(&peer, session)
+        {
+            info!(%peer, "reservation ended");
+        }
+    });
     info!(%peer, "reserved");
     write_frame(&mut conn, id, Msg::Reserved).await?;
     let error = control::serve(conn, pushes, |msg| async move {
-        Msg::Error {
-            message: format!("unexpected {msg:?}"),
-        }
+        Msg::error(format!("unexpected {}", msg.kind()))
     })
     .await;
-    let mut state = shared.state.lock().expect("state lock");
-    if state.reservations.remove(&peer, session) {
-        info!(%peer, %error, "reservation ended");
-    }
+    debug!(%peer, %error, "reservation session ended");
     Ok(())
 }
 
@@ -303,8 +297,11 @@ async fn circuit(
             _permit: permit,
         }
     };
+    let pending = Cleanup::new(|| {
+        shared.state.lock().expect("state lock").pending.remove(&id);
+    });
     let accepted = tokio::time::timeout(shared.limits.accept_timeout, accepted).await;
-    shared.state.lock().expect("state lock").pending.remove(&id);
+    drop(pending);
     let mut other = match accepted {
         Err(_) => {
             return Err(Error::Remote(format!(

@@ -168,7 +168,7 @@ fn verdicts(
     let reachable: Vec<String> = rendezvous
         .iter()
         .flat_map(|r| &r.dial_back)
-        .filter(|d| d.error.is_none())
+        .filter(|d| d.reachable)
         .map(|d| format!("{} over {:?}", d.addr, d.transport))
         .collect();
     let direct = if reachable.is_empty() {

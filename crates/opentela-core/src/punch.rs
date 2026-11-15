@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
-use crate::control::{self, Control};
+use crate::control::{self, Cleanup, Control};
 use crate::identity::PeerId;
 use crate::net::{bind_tcp, connect_tcp};
 use crate::node::{serve_tcp, Inner};
@@ -39,6 +39,14 @@ pub(crate) async fn respond_udp_punch(inner: Arc<Inner>, from: PeerId, record: R
         warn!(%error, "ignoring punch request");
         return;
     }
+    // One spray per peer at a time: repeated requests cannot multiply the packets we send.
+    if !inner.spraying.lock().expect("spray lock").insert(from) {
+        debug!(%from, "already spraying for this peer");
+        return;
+    }
+    let _done = Cleanup::new(|| {
+        inner.spraying.lock().expect("spray lock").remove(&from);
+    });
     debug!(%from, ?record, "spraying UDP");
     spray(&inner, &record.udp_candidates(), inner.timeouts.udp_punch).await;
 }

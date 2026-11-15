@@ -1,7 +1,7 @@
 //! A node: one UDP+TCP port, sessions to every rendezvous and relay kept alive in the background, and the
 //! accepting side of every ladder step.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -133,6 +133,8 @@ pub(crate) struct Inner {
     pub relays: Vec<Slot>,
     incoming: mpsc::Sender<Stream>,
     pub punched_by: Mutex<HashMap<PeerId, Instant>>,
+    /// Peers we are currently spraying UDP for.
+    pub spraying: Mutex<HashSet<PeerId>>,
 }
 
 /// A running node. Dropping it stops every background session.
@@ -167,6 +169,7 @@ impl Node {
             relays: config.relays.iter().map(|a| Slot::new(a)).collect(),
             incoming,
             punched_by: Mutex::default(),
+            spraying: Mutex::default(),
         });
         info!(peer = %inner.id, %local, "node listening");
         let mut tasks = JoinSet::new();

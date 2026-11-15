@@ -351,10 +351,7 @@ async fn preflight_reports_every_step_on_loopback() {
     for step in &report.steps {
         assert!(step.usable, "{step:?} in {report:#?}");
     }
-    assert!(report.rendezvous[0]
-        .dial_back
-        .iter()
-        .any(|d| d.error.is_none()));
+    assert!(report.rendezvous[0].dial_back.iter().any(|d| d.reachable));
     assert!(
         !report.rendezvous[2].control.is_ok(),
         "dead rendezvous is reported, not hidden"
@@ -391,4 +388,36 @@ async fn a_second_process_with_the_same_key_does_not_unregister_the_first() {
             .unwrap_or_else(|e| panic!("{step:?}: {e}"));
         pair(&conn, &b).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dial_back_only_targets_addresses_the_rendezvous_observed() {
+    let fleet = Fleet::new(2);
+    let (rv, _rv_task) = fleet.rendezvous(0);
+    // A bystander the client "advertises"; the rendezvous must never connect to it.
+    let bystander = tokio::net::TcpListener::bind(LOOPBACK).await.unwrap();
+    let bystander_addr = bystander.local_addr().unwrap();
+    let mut config = Config::new(fleet.key(1), fleet.trust.clone());
+    config.listen = LOOPBACK.parse().unwrap();
+    config.rendezvous = vec![rv.to_string()];
+    config.advertise = vec![bystander_addr; 20];
+    let node = Node::start(config).await.unwrap();
+    let report = node.preflight(READY).await;
+    let check = &report.rendezvous[0];
+    let observed: Vec<SocketAddr> = check
+        .tcp_observed
+        .iter()
+        .chain(&check.udp_observed)
+        .copied()
+        .collect();
+    assert!(!check.dial_back.is_empty());
+    assert!(
+        check.dial_back.iter().all(|d| observed.contains(&d.addr)),
+        "{check:?}"
+    );
+    let probed = tokio::time::timeout(Duration::from_millis(500), bystander.accept()).await;
+    assert!(
+        probed.is_err(),
+        "rendezvous dialed a client-supplied address"
+    );
 }

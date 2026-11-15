@@ -158,6 +158,23 @@ where
     error
 }
 
+/// Runs its closure when dropped, so registry entries go away even if the task panics or is cancelled.
+pub(crate) struct Cleanup<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Cleanup<F> {
+    pub(crate) fn new(f: F) -> Self {
+        Self(Some(f))
+    }
+}
+
+impl<F: FnOnce()> Drop for Cleanup<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
 /// Live sessions per peer, newest last. A second process with the same key (a preflight, a restart racing the
 /// old process) takes over, and the older session serves again once the newer one ends.
 #[derive(Debug)]
@@ -209,6 +226,19 @@ impl<T> Sessions<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_runs_on_panic() {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        let unwound = std::panic::catch_unwind(move || {
+            let _cleanup =
+                Cleanup::new(move || flag.store(true, std::sync::atomic::Ordering::SeqCst));
+            panic!("handler bug");
+        });
+        assert!(unwound.is_err());
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[test]
     fn older_session_takes_over_when_the_newer_ends() {

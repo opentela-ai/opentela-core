@@ -71,9 +71,10 @@ enum Command {
         /// LISTEN=PEER/TARGET, e.g. 127.0.0.1:7202=<peer id>/127.0.0.1:7202. Repeatable or comma-separated.
         #[arg(long, value_delimiter = ',')]
         local: Vec<LocalForward>,
-        /// Targets peers may reach through this node, e.g. 127.0.0.1:7202. Anything else is refused.
+        /// PEER/TARGET: lets that one peer reach TARGET (e.g. <peer id>/127.0.0.1:7202) through this node.
+        /// Every other peer and target is refused, trusted or not.
         #[arg(long, value_delimiter = ',')]
-        expose: Vec<SocketAddr>,
+        expose: Vec<Exposure>,
     },
 }
 
@@ -100,6 +101,31 @@ impl FromStr for LocalForward {
                 .map_err(|e| format!("target {target}: {e}"))?,
         })
     }
+}
+
+/// One peer allowed to reach one local target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Exposure {
+    peer: PeerId,
+    target: SocketAddr,
+}
+
+impl FromStr for Exposure {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let (peer, target) = s.split_once('/').ok_or("expected PEER/TARGET")?;
+        Ok(Self {
+            peer: peer.parse().map_err(|e| format!("peer {peer}: {e:?}"))?,
+            target: target
+                .parse()
+                .map_err(|e| format!("target {target}: {e}"))?,
+        })
+    }
+}
+
+fn exposed(expose: &[Exposure], peer: PeerId, target: SocketAddr) -> bool {
+    expose.iter().any(|e| e.peer == peer && e.target == target)
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -301,11 +327,7 @@ const SPLICE_BUFFER: usize = 256 << 10;
 /// One connection per peer, made on first use and remade when a stream cannot be opened on it.
 type Connections = Arc<tokio::sync::Mutex<HashMap<PeerId, Arc<Connection>>>>;
 
-async fn forward(
-    node: Node,
-    local: Vec<LocalForward>,
-    expose: Vec<SocketAddr>,
-) -> Result<(), Error> {
+async fn forward(node: Node, local: Vec<LocalForward>, expose: Vec<Exposure>) -> Result<(), Error> {
     let node = Arc::new(node);
     println!("forwarding as {} on {}", node.peer_id(), node.local_addr());
     let connections: Connections = Arc::default();
@@ -393,7 +415,7 @@ async fn carry(
     Ok(())
 }
 
-async fn deliver(mut stream: opentela_core::Stream, expose: &[SocketAddr]) -> Result<(), Error> {
+async fn deliver(mut stream: opentela_core::Stream, expose: &[Exposure]) -> Result<(), Error> {
     let len = stream.read_u8().await? as usize;
     let mut target = vec![0u8; len];
     stream.read_exact(&mut target).await?;
@@ -401,8 +423,10 @@ async fn deliver(mut stream: opentela_core::Stream, expose: &[SocketAddr]) -> Re
         .ok()
         .and_then(|t| t.parse().ok())
         .ok_or_else(|| Error::Protocol("malformed forward target".into()))?;
-    if !expose.contains(&target) {
-        return Err(Error::Protocol(format!("target {target} is not exposed")));
+    if !exposed(expose, stream.peer(), target) {
+        return Err(Error::Protocol(format!(
+            "target {target} is not exposed to this peer"
+        )));
     }
     let mut socket = TcpStream::connect(target).await?;
     socket.set_nodelay(true)?;
@@ -421,4 +445,27 @@ async fn deliver(mut stream: opentela_core::Stream, expose: &[SocketAddr]) -> Re
 async fn main() -> Result<(), Error> {
     init_logging();
     run(Cli::parse()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exposure_is_per_peer() {
+        let listed = Keypair::generate().peer_id();
+        let other = Keypair::generate().peer_id();
+        let target: SocketAddr = "127.0.0.1:7202".parse().unwrap();
+        let expose = vec![format!("{listed}/{target}").parse::<Exposure>().unwrap()];
+        assert!(exposed(&expose, listed, target));
+        assert!(
+            !exposed(&expose, other, target),
+            "a trusted peer not listed for the target is refused"
+        );
+        assert!(!exposed(&expose, listed, "127.0.0.1:7203".parse().unwrap()));
+        assert!(
+            "127.0.0.1:7202".parse::<Exposure>().is_err(),
+            "an exposure must name a peer"
+        );
+    }
 }

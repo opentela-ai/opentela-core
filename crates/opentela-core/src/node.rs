@@ -16,7 +16,7 @@ use crate::control::Control;
 use crate::identity::{Keypair, PeerId, TrustPolicy};
 use crate::net::{bind_tcp, bind_udp, tune};
 use crate::services::{maintain, relay_session, rendezvous_quic, rendezvous_session};
-use crate::stream::{Io, PathKind, Stream, Transport, HELLO_PROBE, HELLO_STREAM};
+use crate::stream::{Io, PathKind, QuicCongestion, Stream, Transport, HELLO_PROBE, HELLO_STREAM};
 use crate::tls::{quic_identity, ChannelBinding, Tls, ALPN_PEER};
 use crate::{Error, Step};
 
@@ -62,6 +62,7 @@ pub struct Config {
     pub relays: Vec<String>,
     pub ladder: Vec<Step>,
     pub timeouts: Timeouts,
+    pub quic_congestion: QuicCongestion,
 }
 
 impl Config {
@@ -75,6 +76,7 @@ impl Config {
             relays: Vec::new(),
             ladder: Step::ALL.to_vec(),
             timeouts: Timeouts::default(),
+            quic_congestion: QuicCongestion::default(),
         }
     }
 }
@@ -146,7 +148,8 @@ pub struct Node {
 
 impl Node {
     pub async fn start(config: Config) -> Result<Self, Error> {
-        let tls = Tls::new(&config.keypair, config.trust)?;
+        let tls =
+            Tls::new(&config.keypair, config.trust)?.with_quic_congestion(config.quic_congestion);
         let (udp, tcp) = bind_pair(config.listen)?;
         let local = udp.local_addr()?;
         let quic = quinn::Endpoint::new(

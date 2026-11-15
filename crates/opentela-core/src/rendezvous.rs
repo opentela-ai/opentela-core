@@ -16,7 +16,7 @@ use tracing::{debug, info};
 
 use crate::control::{self, Cleanup, Sessions};
 use crate::identity::{Keypair, PeerId, TrustPolicy};
-use crate::net::{bind_tcp, bind_udp};
+use crate::net::{bind_tcp, bind_udp, prefer_bbr, tune};
 use crate::tls::{quic_identity, Expect, Tls, ALPN_PEER, ALPN_RENDEZVOUS};
 use crate::wire::{read_frame, sanitize_registration, write_frame, DialBack, Msg, Record};
 use crate::{Error, Transport};
@@ -165,6 +165,10 @@ async fn observe_udp(shared: Arc<Shared>, incoming: quinn::Incoming) {
 }
 
 async fn session(shared: &Arc<Shared>, stream: TcpStream, remote: SocketAddr) -> Error {
+    if let Err(e) = tune(&stream) {
+        return e;
+    }
+    prefer_bbr(&stream);
     let handshake = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         shared.tls.accept(stream, &[ALPN_RENDEZVOUS]),

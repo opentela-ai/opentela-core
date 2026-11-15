@@ -24,7 +24,7 @@ pub use node::{Config, Node, Timeouts};
 pub use preflight::{PreflightReport, RelayCheck, RendezvousCheck, StepCheck};
 pub use relay::{RelayConfig, RelayLimits, RelayServer};
 pub use rendezvous::{RendezvousConfig, RendezvousServer};
-pub use stream::{Attempt, Outcome, PathKind, PathReport, Step, Stream, Transport};
+pub use stream::{Attempt, Outcome, PathKind, PathReport, QuicCongestion, Step, Stream, Transport};
 pub use tls::ChannelBinding;
 pub use wire::DialBack;
 

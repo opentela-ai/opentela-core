@@ -5,6 +5,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use quinn::congestion;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::AlwaysResolvesClientRawPublicKeys;
@@ -26,6 +27,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::{client, server, TlsAcceptor, TlsConnector};
 
 use crate::identity::{Keypair, PeerId, TrustPolicy};
+use crate::stream::QuicCongestion;
 use crate::Error;
 
 pub(crate) const ALPN_PEER: &[u8] = b"otela/peer/1";
@@ -213,6 +215,7 @@ pub(crate) struct Tls {
     key: Arc<CertifiedKey>,
     trust: Arc<TrustPolicy>,
     provider: Arc<CryptoProvider>,
+    congestion: QuicCongestion,
 }
 
 impl Tls {
@@ -228,7 +231,17 @@ impl Tls {
             key,
             trust: Arc::new(trust),
             provider,
+            congestion: QuicCongestion::default(),
         })
+    }
+
+    pub(crate) fn with_quic_congestion(mut self, congestion: QuicCongestion) -> Self {
+        self.congestion = congestion;
+        self
+    }
+
+    pub(crate) fn quic_congestion(&self) -> QuicCongestion {
+        self.congestion
     }
 
     pub(crate) fn trust(&self) -> &TrustPolicy {
@@ -274,7 +287,7 @@ impl Tls {
         let crypto = QuicClientConfig::try_from(self.client_config(expect, alpn))
             .expect("TLS 1.3 with AES-128-GCM is configured");
         let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-        config.transport_config(quic_transport());
+        config.transport_config(quic_transport(self.congestion));
         config
     }
 
@@ -282,7 +295,7 @@ impl Tls {
         let crypto = QuicServerConfig::try_from(self.server_config(alpns))
             .expect("TLS 1.3 with AES-128-GCM is configured");
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-        config.transport_config(quic_transport());
+        config.transport_config(quic_transport(self.congestion));
         config
     }
 
@@ -326,8 +339,19 @@ impl Tls {
 /// Keepalives refresh NAT bindings. quinn closes a connection whose stream has more than 1024 reassembly gaps;
 /// a 2 MiB stream window (~870 alternating lost packets) cannot reach that, where 16 MiB did under loss bursts
 /// at a 2.5 GbE bottleneck. One stream then carries at most 2 MiB per RTT, so bulk transfers use several.
-fn quic_transport() -> Arc<quinn::TransportConfig> {
+fn quic_transport(congestion: QuicCongestion) -> Arc<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
+    match congestion {
+        QuicCongestion::Bbr => {
+            transport.congestion_controller_factory(Arc::new(congestion::BbrConfig::default()))
+        }
+        QuicCongestion::Cubic => {
+            transport.congestion_controller_factory(Arc::new(congestion::CubicConfig::default()))
+        }
+        QuicCongestion::NewReno => {
+            transport.congestion_controller_factory(Arc::new(congestion::NewRenoConfig::default()))
+        }
+    };
     transport
         .max_concurrent_bidi_streams(1024u32.into())
         .stream_receive_window((2u32 << 20).into())

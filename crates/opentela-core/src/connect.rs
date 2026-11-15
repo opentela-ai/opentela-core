@@ -11,12 +11,13 @@ use tokio::task::JoinSet;
 use tracing::{debug, info};
 
 use crate::identity::PeerId;
-use crate::net::connect_tcp;
+use crate::net::{connect_tcp, tcp_congestion};
 use crate::node::{Inner, Node};
 use crate::punch::{punch_socket, sim_open, spray};
 use crate::services::resolve;
 use crate::stream::{
-    Attempt, Outcome, PathKind, PathReport, Stream, Transport, HELLO_PROBE, HELLO_STREAM,
+    Attempt, Outcome, PathKind, PathReport, QuicCongestion, Stream, Transport, HELLO_PROBE,
+    HELLO_STREAM,
 };
 use crate::tls::{quic_identity, ChannelBinding, Expect, ALPN_PEER, ALPN_RELAY};
 use crate::wire::{read_frame, write_frame, Msg, Record};
@@ -288,6 +289,7 @@ fn quic_established(
     peer: PeerId,
     conn: quinn::Connection,
     kind: PathKind,
+    congestion: QuicCongestion,
 ) -> Result<Established, Error> {
     let (seen, binding) = quic_identity(&conn)?;
     debug_assert_eq!(seen, peer, "the verifier pinned the peer id");
@@ -297,6 +299,7 @@ fn quic_established(
         transport: Transport::Quic,
         via: conn.remote_address().to_string(),
         rtt_ms: conn.min_rtt().as_secs_f64() * 1e3,
+        congestion: format!("quic:{}", congestion.as_str()),
         throughput_bps: None,
         attempts: Vec::new(),
     };
@@ -316,6 +319,7 @@ async fn tls_over_tcp(
     route: Route,
 ) -> Result<Established, Error> {
     let via = tcp.peer_addr()?.to_string();
+    let congestion = tcp_congestion(&tcp);
     let started = Instant::now();
     let (tls, _, binding) = inner
         .tls
@@ -327,6 +331,7 @@ async fn tls_over_tcp(
         transport: Transport::Tcp,
         via,
         rtt_ms: started.elapsed().as_secs_f64() * 1e3,
+        congestion,
         throughput_bps: None,
         attempts: Vec::new(),
     };
@@ -362,6 +367,7 @@ async fn direct(inner: &Arc<Inner>, peer: PeerId, record: &Record) -> Result<Est
                 peer,
                 quic_dial(&quic_inner, peer, addr).await?,
                 PathKind::Direct,
+                quic_inner.tls.quic_congestion(),
             )
         });
         let tcp_inner = inner.clone();
@@ -436,6 +442,7 @@ async fn udp_punch(inner: &Arc<Inner>, peer: PeerId, rv: usize) -> Result<Establ
                     peer,
                     quic_dial(&inner, peer, addr).await?,
                     PathKind::Punched,
+                    inner.tls.quic_congestion(),
                 )
             });
         }
@@ -499,6 +506,7 @@ async fn relay_via(inner: &Inner, peer: PeerId, addr: &str) -> Result<Establishe
     for remote in resolve(inner, addr).await? {
         let attempt = async {
             let tcp = connect_tcp(None, remote, inner.timeouts.control).await?;
+            let congestion = tcp_congestion(&tcp);
             let (mut outer, _, _) = inner
                 .tls
                 .connect(tcp, Expect::AnyTrusted, ALPN_RELAY)
@@ -530,6 +538,7 @@ async fn relay_via(inner: &Inner, peer: PeerId, addr: &str) -> Result<Establishe
                 transport: Transport::Tcp,
                 via: addr.to_string(),
                 rtt_ms,
+                congestion,
                 throughput_bps: None,
                 attempts: Vec::new(),
             };

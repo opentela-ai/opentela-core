@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use opentela_bin::{init_logging, IdentityArgs};
-use opentela_core::{Config, Error, Keypair, Node, PeerId, Step};
+use opentela_core::{Config, Error, Keypair, Node, PeerId, QuicCongestion, Step};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
@@ -66,6 +66,13 @@ enum LadderStep {
     Relay,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Congestion {
+    Bbr,
+    Cubic,
+    NewReno,
+}
+
 #[derive(Debug, Args)]
 struct NodeArgs {
     #[command(flatten)]
@@ -82,6 +89,9 @@ struct NodeArgs {
     /// Ladder steps to try, in order (default: all).
     #[arg(long, value_delimiter = ',')]
     ladder: Vec<LadderStep>,
+    /// quinn congestion controller for QUIC paths.
+    #[arg(long, value_enum, default_value = "bbr")]
+    quic_congestion: Congestion,
 }
 
 impl NodeArgs {
@@ -92,6 +102,11 @@ impl NodeArgs {
         config.advertise = self.advertise.clone();
         config.rendezvous = self.rendezvous.clone();
         config.relays = self.relay.clone();
+        config.quic_congestion = match self.quic_congestion {
+            Congestion::Bbr => QuicCongestion::Bbr,
+            Congestion::Cubic => QuicCongestion::Cubic,
+            Congestion::NewReno => QuicCongestion::NewReno,
+        };
         if !self.ladder.is_empty() {
             config.ladder = self
                 .ladder

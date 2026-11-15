@@ -56,6 +56,24 @@ pub(crate) async fn connect_tcp(
     Ok(stream)
 }
 
+/// Servers ask for BBR on their own sockets and keep the kernel default where the module is missing.
+pub(crate) fn prefer_bbr(stream: &TcpStream) {
+    if let Err(error) = SockRef::from(stream).set_tcp_congestion(b"bbr") {
+        tracing::debug!(%error, "bbr unavailable; keeping the default congestion control");
+    }
+}
+
+/// `tcp:<algorithm>` of a connected socket, for path reports.
+pub(crate) fn tcp_congestion(stream: &TcpStream) -> String {
+    match SockRef::from(stream).tcp_congestion() {
+        Ok(name) => format!(
+            "tcp:{}",
+            String::from_utf8_lossy(&name).trim_end_matches('\0')
+        ),
+        Err(_) => "tcp:unknown".into(),
+    }
+}
+
 pub(crate) fn tune(stream: &TcpStream) -> Result<(), Error> {
     stream.set_nodelay(true)?;
     SockRef::from(stream).set_tcp_keepalive(

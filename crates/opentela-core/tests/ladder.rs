@@ -140,6 +140,10 @@ async fn every_step_authenticates_and_binds_the_channel() {
             "{step:?}: {report:?}"
         );
         assert!(report.attempts.last().unwrap().outcome.is_ok());
+        match transport {
+            Transport::Quic => assert_eq!(report.congestion, "quic:bbr"),
+            Transport::Tcp => assert!(report.congestion.starts_with("tcp:"), "{report:?}"),
+        }
 
         let (s1, r1) = pair(&conn, &b).await;
         assert_eq!(s1.peer(), fleet.id(3));

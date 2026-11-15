@@ -16,7 +16,7 @@ use tracing::{debug, info};
 
 use crate::control::{self, Cleanup, Sessions};
 use crate::identity::{Keypair, PeerId, TrustPolicy};
-use crate::net::{bind_tcp, tune};
+use crate::net::{bind_tcp, prefer_bbr, tune};
 use crate::tls::{Tls, ALPN_RELAY};
 use crate::wire::{read_frame, write_frame, Msg};
 use crate::Error;
@@ -130,6 +130,7 @@ async fn connection(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<(), Error> {
     tune(&stream)?;
+    prefer_bbr(&stream);
     let first = async {
         let (mut conn, peer, _, _) = shared.tls.accept(stream, &[ALPN_RELAY]).await?;
         let frame = read_frame(&mut conn).await?;
@@ -367,7 +368,10 @@ async fn pump(
                 return Ok(total);
             }
             Ok(Ok(n)) => {
+                // TLS buffers records it could not send yet; without a flush the tail of a burst can sit
+                // there until the idle timeout while the sender waits for a reply.
                 to.write_all(&buf[..n]).await?;
+                to.flush().await?;
                 total += n as u64;
                 last.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
             }
@@ -377,6 +381,35 @@ async fn pump(
                 return Ok(total);
             }
             Ok(Err(e)) => return Err(e.into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pump_delivers_a_burst_tail_while_the_source_stays_open() {
+        let (mut source, from) = tokio::io::duplex(1 << 16);
+        let (to, mut sink) = tokio::io::duplex(1 << 16);
+        // Like a TLS stream, BufWriter holds written bytes until flushed.
+        let to = tokio::io::BufWriter::with_capacity(1 << 20, to);
+        let last = AtomicU64::new(0);
+        let start = Instant::now();
+        let pumping = pump(from, to, start, &last, Duration::from_secs(60));
+        let check = async {
+            source.write_all(b"tail of a burst").await.unwrap();
+            let mut got = [0u8; 15];
+            tokio::time::timeout(Duration::from_secs(2), sink.read_exact(&mut got))
+                .await
+                .expect("pump flushed what it read")
+                .unwrap();
+            assert_eq!(&got, b"tail of a burst");
+        };
+        tokio::select! {
+            _ = pumping => panic!("pump ended while the source is open"),
+            () = check => {}
         }
     }
 }

@@ -42,7 +42,7 @@ attempt goes into `PathReport::attempts`:
 | `Direct` | 3 s | QUIC and TCP+TLS raced to the advertised addresses. QUIC is preferred: if TCP wins, QUIC gets 500 ms more |
 | `UdpPunch` | 6 s | `Lookup{punch}` makes the rendezvous tell the peer to spray UDP at our observed address. Meanwhile we send staggered QUIC dials (0, 0.2, 0.5, 1, 2, 3.5 s) to its observed and advertised addresses |
 | `TcpPunch` | 6 s | Each side opens a fresh port and a rendezvous connection from it, so the rendezvous sees that port's mapping and swaps the two. Both sides then simultaneous-open. The responder also listens on its punch port, because a host with no NAT answers early SYNs with RST |
-| `Relay` | 8 s per relay | TCP+TLS to a relay. The peer's relays come first (from its record), then ours. Inside the circuit, the two peers run their own TLS session. If no rendezvous is reachable, this step still works |
+| `Relay` | 8 s per relay | TCP to a relay, admitted by a signed preamble. The peer's relays come first (from its record), then ours. Inside the circuit, the two peers run their own TLS session. If no rendezvous is reachable, this step still works |
 
 **Rendezvous** (`rendezvous` binary, TCP and UDP on one port). Peers register `{listen addrs, relays}` and get
 back their observed TCP address. A QUIC connection from the listen socket reports the observed UDP address,
@@ -52,10 +52,40 @@ over TCP and over QUIC. It dials only the addresses it observed for the peer, ne
 supplied, and it answers with one boolean per address. A reply from the port the peer contacted would
 pass a stateful firewall and prove nothing.
 
-**Relay** (`relay` binary, default port 443). A peer holds a reservation, which is a long-lived control
-session. To reach it, a dialer opens a TCP+TLS connection and sends `Dial{target}`. The relay pushes
-`Circuit` to the target, the target opens its own connection with `Accept`, and the relay splices the two.
-The relay never holds the peers' keys, so it sees only ciphertext and cannot impersonate either side.
+**Relay** (`relay` binary, default port 443). A peer holds a reservation, which is a long-lived TLS control
+session. Circuits do not use an outer TLS layer. A dialer opens a plain TCP connection and proves its key
+in a signed preamble, asking to `Dial` the target. The relay pushes `Circuit` to the target, the target
+opens its own connection with the same preamble to `Accept`, and the relay copies bytes between the two.
+From then on a circuit carries only the peers' own TLS 1.3 session, and the relay neither decrypts nor
+re-encrypts it. The relay never holds the peers' keys, so it sees only ciphertext and cannot impersonate
+either side. Both kinds of connection share the port: a TLS record starts with 0x16, and a circuit starts
+with `OTELACIR`.
+
+How circuits are admitted (`crates/opentela-core/src/circuit.rs`):
+
+1. The client sends `OTELACIR` and `{client id, client nonce}`.
+2. The relay answers `{relay id, relay nonce, relay signature}`, signed over (label, both ids, both
+   nonces). This proves the relay is a trusted one.
+3. The client answers `{purpose, client signature}`, signed over (label, both ids, both nonces, purpose).
+   The purpose is `Dial{target}` or `Accept{circuit}`.
+
+The relay admits only allow-listed keys whose signature verifies.
+
+- **Replay.** The relay's nonce is fresh per connection, so a recorded preamble fails.
+- **Confused deputy.** The relay's id and nonce are in the signed transcript, so a signature a client
+  made for one relay (even a trusted one acting maliciously) is useless at another.
+- **Purpose.** The purpose is signed, so a Dial can't be relabelled as an Accept, or pointed at another
+  target.
+- **Accept.** An `Accept` is honoured only for the peer the circuit was offered to.
+
+Tests cover replay, cross-relay reuse, purpose rewriting and untrusted keys on either side.
+
+What is visible: the preamble is plaintext, so an observer sees both peer ids, the target peer id or
+circuit number, and the relay's error messages. Payload stays end-to-end encrypted. An on-path attacker
+can still reset or blackhole a circuit, but could do that to TCP anyway. Middleboxes see the 8-byte magic
+and two short JSON frames before the TLS ClientHello. Every network in the matrix carried it on 443
+unchanged (CSCS compute, mit3090, sgs-gpu07, ds6). A box that insists the first byte on 443 is TLS would
+block circuits.
 Resources are bounded: total reservations, total circuits, circuits per peer, an idle timeout per circuit,
 an accept timeout, and the number of connections in handshake. Each limit rejects with an error frame and
 never queues.
@@ -164,7 +194,7 @@ A changed allow list takes effect after `systemctl restart otela-rendezvous otel
 ## Tests
 
 ```sh
-cargo test        # 14 unit + 9 in-process integration tests over loopback
+cargo test        # 18 unit + 9 in-process integration + 1 CLI test
 ```
 
 The integration tests (`crates/opentela-core/tests/ladder.rs`) cover:
@@ -224,11 +254,23 @@ Findings:
   refuses mit3090's unsolicited packets. A single QUIC stream is capped at 2 MiB per RTT, about 0.2
   Gbit/s at 81 ms (see Decisions), so use 8 or more streams. The mit3090 path tops out near 0.9 Gbit/s
   on every step.
-- **Relay CPU.** On the 1-vCPU VM the relay process ran at 67–83% mean CPU, peaking at 95–100%, while
-  moving 1.5–1.9 Gbit/s, with the VM shared by other services. Per byte it decrypts and re-encrypts the
-  outer TLS once per direction. So the VM's single core is the relay's ceiling at roughly 2–3 Gbit/s,
-  which is about what CSCS ↔ sgs-gpu07 reaches. A second vCPU, or dropping the outer TLS on circuits
-  (the inner TLS is end to end anyway), would raise it. RSS stays around 11 MB.
+- **Relay CPU, before and after dropping the outer TLS on circuits.** Both relays ran on the same VM at
+  the same time (the old one on 443, the new one on 4443). Each CSCS node ran on its own, two rounds,
+  with 2 GiB per run. The figures are relay process CPU on the single vCPU, then Gbit/s:
+
+  | Pair | Streams | Outer TLS (before) | Raw splice (after) |
+  | --- | --- | --- | --- |
+  | clariden compute → sgs-gpu07 | 1 | 53–59%, 2.07–2.23 | 17–18%, 2.10–2.12 |
+  | | 4 | 58–73%, 1.69–2.11 | 16–22%, 2.08–2.12 |
+  | | 8 | 78–80%, 2.13–2.22 | 30–32%, 2.18–2.21 |
+  | beverin compute → sgs-gpu07 | 1 | 51–55%, 2.07–2.23 | 16–26%, 1.78–2.24 |
+  | | 4 | 56–61%, 2.07–2.12 | 17–19%, 2.11 |
+  | | 8 | 68–80%, 1.53–2.22 | 32–33%, 2.15–2.20 |
+
+  Relay CPU per byte fell about 3×, and the channel binding matched in every run. Throughput did not
+  rise: both modes sit at a ceiling of about 2.2 Gbit/s that is not the relay. It is the VM's network or
+  the ETH ingress to sgs-gpu07. The relay now leaves most of the core to the VM's other tenants, and the
+  `ocf` process uses 30–40%. RSS stays around 11 MB.
 - **A real bug found here:** one in three relayed 8-stream transfers stalled for about 120 s. The relay
   did not flush TLS after a write, so the tail of a burst sat in rustls until the idle timeout. This is
   fixed with a regression test. Since the fix, 6 of 6 runs were clean.
@@ -241,8 +283,9 @@ laptop on any port, including 22, 443 and UDP. Only hosts inside ETH such as sgs
 - Peer id is the raw public key, not a hash, so no lookup is needed to verify one.
 - The crypto provider is `ring`, chosen over `aws-lc-rs` so the build needs no cmake or nasm on aarch64
   and HPC images.
-- The relay keeps the outer TLS on circuits, so traffic on 443 looks like TLS to middleboxes. The cost is
-  double encryption at the peers, and decrypt/re-encrypt at the relay.
+- Circuits carry no outer TLS layer, and that mode is not kept as an option. Keeping it would mean two
+  circuit protocols, and it cost 60–80% of the VM's only core. Reservations keep TLS: they are tiny, and
+  TLS protects their pushes.
 - TCP paths use one TLS connection per stream, with no multiplexer. Parallel streams then get independent
   congestion windows, which is what bulk transfer wants.
 - TCP punching uses fresh ports per stream. Reusing the listen port allows only one connection per port
